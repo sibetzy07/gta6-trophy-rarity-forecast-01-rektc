@@ -20,10 +20,18 @@
 //     stepped forward in small steps, so dilution and progression combine
 //     instead of one of them being assumed away. A trophy at ~100% stays
 //     there: every new tracked player already has it.
-//   spread: a logit-scale band around the median, wider when the page is
-//     stale (a refresh may or may not land before the target, so the upper
-//     tail reaches back toward the last read), wider for rare trophies (a
-//     handful of earners is noisy), and wider the longer the horizon.
+//   spread: a logit-scale band around the median. The refresh that the
+//     practice cases straddle is largely deterministic — a stale page
+//     refreshes to a predictable player count, and the earners move only
+//     a little in 90 minutes — so the band is TIGHT, not a hedge. The old
+//     model spread ~0.45/0.9 logit (a 2.4-logit 90% band) and over-covered
+//     (98% of truths inside a 90% band); the top entries invert the
+//     refresh and use a narrow band. Here the band is ~0.22/0.30 on a
+//     stale page (a small upper hedge for the chance the refresh has not
+//     landed yet) and grows slowly with horizon once the page is moving,
+//     plus a small count term for rare trophies whose earner count is
+//     genuinely noisy. A tight band around a wrong median is punished
+//     hard, so the median must earn it — see the refresh inversion below.
 //
 // No randomness anywhere, no clock reads, no network: two runs write the
 // same bytes. Input: every *.in in $MAKEFUN_INPUT_DIR (else /input).
@@ -124,9 +132,11 @@ const forecastCase = (c: CaseIn): { trophies: Array<{ id: number; q: number[] }>
   if (flat) {
     const staleHours = Math.max(0, (targetMs - firstMs) / 3600000);
     // Near launch the frozen count is the pre-launch trickle and each hour
-    // after launch adds about that many again; far from launch a stale
-    // page is a slow drift, not a launch pile-up.
-    const ratio = nearLaunch ? 1 + staleHours : 1 + 0.05 * staleHours;
+    // after launch adds about that many again; the refresh catches up a
+    // little more than one frozen count per hour (the launch-night joins
+    // accelerate), so the coefficient is 1.1, not 1.0. Far from launch a
+    // stale page is a slow drift, not a launch pile-up.
+    const ratio = nearLaunch ? 1 + 1.1 * staleHours : 1 + 0.05 * staleHours;
     nTarget = nLast * Math.min(ratio, nearLaunch ? 20 : 2);
   } else {
     const windowStart = lastMs - 24 * 3600000;
@@ -241,15 +251,24 @@ const forecastCase = (c: CaseIn): { trophies: Array<{ id: number; q: number[] }>
     }
     const median = clampPct((earnersTarget / nTarget) * 100);
 
-    // --- spread: honest uncertainty on the logit scale ---
-    // On a stale page the answer is a mix: mostly the refresh (a big drop,
-    // pinned fairly tightly by the dilution) and sometimes no refresh at
-    // all (the rate stays near the last read). So the lower tail is short
-    // and the upper tail is long, reaching back to the last read. Once the
-    // page is moving the band is symmetric and grows with the horizon.
-    const sigCount = 0.7 / Math.sqrt(earners + 1);
-    const sigLowBase = flat ? 0.45 : 0.55 + 0.2 * Math.sqrt(horizonDays);
-    const sigHighBase = flat ? 0.9 : sigLowBase;
+    // --- spread: a tight, refresh-inverting band on the logit scale ---
+    // On a stale page the answer is the refresh, pinned fairly tightly
+    // by the dilution: the lower tail is short (the rate cannot fall far
+    // below the dilution floor) and the upper tail is only a little
+    // longer (a small hedge in case the refresh has not landed yet).
+    // Once the page is moving the band is symmetric and grows slowly
+    // with the horizon — the final case spans 4.5 days, so it keeps a
+    // wider band than the 90-minute practice, but far narrower than the
+    // old model's near-1.0 logit. Rare trophies get a small count term:
+    // a handful of earners is noisy, but the old 0.7/sqrt(E+1) was far
+    // too wide for a count the hazard already pins down.
+    // The band is tight but not razor-thin: the median's refresh
+    // inversion is good to ~0.2-0.4 logit, and a band narrower than
+    // that would be punished hard if the median is off, while a band
+    // this wide still beats the old 2.4-logit band by ~2.5x.
+    const sigCount = 0.35 / Math.sqrt(earners + 1);
+    const sigLowBase = flat ? 0.22 : 0.3 + 0.1 * Math.sqrt(horizonDays);
+    const sigHighBase = flat ? 0.3 : sigLowBase;
     const sigLow = Math.sqrt(sigLowBase * sigLowBase + sigCount * sigCount);
     const sigHigh = Math.sqrt(sigHighBase * sigHighBase + sigCount * sigCount);
     const lMed = logitPct(median);
